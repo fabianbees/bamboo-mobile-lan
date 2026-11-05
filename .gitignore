@@ -9,6 +9,7 @@ lerna-debug.log*
 
 openbu-mock
 BambooMobile-Slicer
+/experiments
 node_modules
 dist
 dist-ssr

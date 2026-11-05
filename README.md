@@ -72,9 +72,33 @@ pnpm tauri dev
 
 ### Android build
 
+Needs only Docker; the toolchain (JDK, Android SDK and NDK, Rust, Node) is pinned in [docker/android/Dockerfile](docker/android/Dockerfile).
+
 ```bash
-pnpm tauri android build
+./build-android.sh
 ```
+
+The APK lands in the project root as `bamboo-mobile-<version>.apk`, or `bamboo-mobile-<version>-unsigned.apk` when no signing key is configured. Android refuses to install an unsigned APK.
+
+The build runs on a copy of the tracked and untracked-but-not-ignored files, so it leaves your working tree alone. Cargo, Gradle and pnpm caches persist in Docker volumes named `bamboo-mobile-android-*`; remove them to build from cold.
+
+With a local Android toolchain, `pnpm tauri android build --apk` works too.
+
+#### Signing
+
+Set `KEYSTORE_BASE64`, `KEY_ALIAS`, `KEY_PASSWORD` and `STORE_PASSWORD` in the environment, or copy `.env.android.example` to `.env.android` and fill it in. A new keystore:
+
+```bash
+docker run --rm -it -v "$PWD:/w" -w /w eclipse-temurin:21-jdk \
+  keytool -genkeypair -keystore release.jks -alias bamboo-mobile -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 release.jks   # value for KEYSTORE_BASE64
+```
+
+Keep the keystore and its passwords safe: Android only installs an update over an existing app when both are signed with the same key.
+
+#### CI
+
+[.github/workflows/android-release.yml](.github/workflows/android-release.yml) runs `build-android.sh` on every `v*` tag and on manual dispatch. Each run uploads the APK as a workflow artifact; tag runs also attach it to the GitHub release. The four signing variables come from repository secrets of the same names; without them the APK is unsigned.
 
 You'll need your printer's **IP address**, **access code** (touchscreen → Settings → WLAN), and **serial number**. The app asks for these on first launch and remembers them.
 
