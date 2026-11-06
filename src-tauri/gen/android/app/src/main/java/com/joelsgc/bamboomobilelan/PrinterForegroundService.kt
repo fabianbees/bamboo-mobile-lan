@@ -1,4 +1,4 @@
-package com.joelsgc.bamboomobile
+package com.joelsgc.bamboomobilelan
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -414,7 +414,7 @@ class PrinterForegroundService : Service() {
                 "Print Progress",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description  = "Ongoing print progress from BambooMobile"
+                description  = "Ongoing print progress from Bamboo Mobile LAN"
                 setShowBadge(false)
                 setSound(null, null)
                 enableVibration(false)

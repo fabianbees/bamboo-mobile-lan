@@ -75,7 +75,7 @@ async function ensurePrintChannel() {
   await createChannel({
     id: 'bamboo_print_progress',
     name: 'Print Progress',
-    description: 'Ongoing print progress from BambooMobile',
+    description: 'Ongoing print progress from Bamboo Mobile LAN',
     importance: Importance.Low,   // silent — no heads-up, no sound
     visibility: Visibility.Public,
     vibration: false,

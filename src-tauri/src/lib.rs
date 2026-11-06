@@ -954,7 +954,7 @@ async fn connect_printer(
         .with_custom_certificate_verifier(Arc::new(SkipVerifier))
         .with_no_client_auth();
 
-    let mut opts = MqttOptions::new("bamboo-mobile", &ip, 8883);
+    let mut opts = MqttOptions::new("bamboo-mobile-lan", &ip, 8883);
     opts.set_credentials("bblp", &access_code);
     opts.set_keep_alive(std::time::Duration::from_secs(10));
     opts.set_transport(Transport::Tls(TlsConfiguration::Rustls(Arc::new(tls_cfg))));
@@ -2278,7 +2278,7 @@ pub fn run() {
         tauri::plugin::Builder::<tauri::Wry, ()>::new("printNotification")
             .setup(|app, api| {
                 match api.register_android_plugin(
-                    "com.joelsgc.bamboomobile",
+                    "com.joelsgc.bamboomobilelan",
                     "PrintNotificationPlugin",
                 ) {
                     Ok(handle) => {

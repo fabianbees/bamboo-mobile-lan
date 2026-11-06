@@ -6,7 +6,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-image=bamboo-mobile-android-build
+image=bamboo-mobile-lan-android-build
 signing_vars=(KEYSTORE_BASE64 KEY_ALIAS KEY_PASSWORD STORE_PASSWORD)
 
 if [[ -f .env.android ]]; then
@@ -22,10 +22,10 @@ fi
 docker build -t "$image" docker/android
 
 container=$(docker create -i \
-  -v bamboo-mobile-android-cargo:/usr/local/cargo/registry \
-  -v bamboo-mobile-android-target:/build/src-tauri/target \
-  -v bamboo-mobile-android-gradle:/root/.gradle \
-  -v bamboo-mobile-android-pnpm:/root/.local/share/pnpm \
+  -v bamboo-mobile-lan-android-cargo:/usr/local/cargo/registry \
+  -v bamboo-mobile-lan-android-target:/build/src-tauri/target \
+  -v bamboo-mobile-lan-android-gradle:/root/.gradle \
+  -v bamboo-mobile-lan-android-pnpm:/root/.local/share/pnpm \
   "${signing_vars[@]/#/--env=}" \
   "$image" \
   bash -c 'tar -x --no-same-owner && docker/android/build-apk.sh')

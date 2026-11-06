@@ -18,8 +18,8 @@ if [[ -n ${KEYSTORE_BASE64:-} ]]; then
     --ks-pass env:STORE_PASSWORD \
     --key-pass env:KEY_PASSWORD \
     --v4-signing-enabled false \
-    --out "/out/bamboo-mobile-$version.apk" \
+    --out "/out/bamboo-mobile-lan-$version.apk" \
     "$unsigned"
 else
-  cp "$unsigned" "/out/bamboo-mobile-$version-unsigned.apk"
+  cp "$unsigned" "/out/bamboo-mobile-lan-$version-unsigned.apk"
 fi

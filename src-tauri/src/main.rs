@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    bamboo_mobile_lib::run()
+    bamboo_mobile_lan_lib::run()
 }

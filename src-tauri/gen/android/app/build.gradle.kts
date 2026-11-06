@@ -16,10 +16,10 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 37
-    namespace = "com.joelsgc.bamboomobile"
+    namespace = "com.joelsgc.bamboomobilelan"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.joelsgc.bamboomobile"
+        applicationId = "com.joelsgc.bamboomobilelan"
         minSdk = 24
         targetSdk = 37
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

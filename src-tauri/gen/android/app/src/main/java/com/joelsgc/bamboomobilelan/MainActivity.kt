@@ -1,4 +1,4 @@
-package com.joelsgc.bamboomobile
+package com.joelsgc.bamboomobilelan
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge

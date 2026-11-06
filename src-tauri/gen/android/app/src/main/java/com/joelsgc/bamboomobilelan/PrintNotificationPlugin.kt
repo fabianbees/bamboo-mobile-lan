@@ -1,4 +1,4 @@
-package com.joelsgc.bamboomobile
+package com.joelsgc.bamboomobilelan
 
 import android.app.Activity
 import android.content.Context

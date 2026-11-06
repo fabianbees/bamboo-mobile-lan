@@ -176,7 +176,7 @@ export default function Dashboard({
           </svg>
         </button>
         <div className='flex flex-col items-center'>
-          <h1 className='font-semibold text-lg'>BambooMobile</h1>
+          <h1 className='font-semibold text-lg'>Bamboo Mobile LAN</h1>
         </div>
       </div>
 

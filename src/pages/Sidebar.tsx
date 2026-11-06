@@ -90,7 +90,7 @@ export default function Sidebar({
         }`}
         style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
         <div className='flex items-center justify-between px-5 py-4 border-b border-zinc-800'>
-          <span className='text-white font-semibold'>BambooMobile</span>
+          <span className='text-white font-semibold'>Bamboo Mobile LAN</span>
           <button
             onClick={onClose}
             className='text-zinc-400 hover:text-white transition-colors w-8 h-8 flex items-center justify-center'>
