@@ -1,4 +1,4 @@
-ARG JDK_MAJOR=21
+ARG JDK_MAJOR=25
 ARG RUST_VERSION=1.99.1
 ARG NODE_MAJOR=26
 
@@ -8,10 +8,11 @@ FROM rust:${RUST_VERSION}-slim-trixie AS rust
 FROM node:${NODE_MAJOR}-trixie-slim
 
 ARG CMDLINE_TOOLS_BUILD=16111833
-# Must match compileSdk in src-tauri/gen/android/app/build.gradle.kts.
-ARG ANDROID_PLATFORM=36
-# The default of the Android Gradle Plugin version in use; AGP downloads it on every build otherwise.
-ARG ANDROID_BUILD_TOOLS=35.0.0
+# AGP downloads whatever of these is missing on every build.
+# The compileSdk of src-tauri/gen/android/app/build.gradle.kts and of the Tauri crates' Android libraries:
+ARG ANDROID_PLATFORMS="37.0 36"
+# The default of the Android Gradle Plugin version in use:
+ARG ANDROID_BUILD_TOOLS=36.0.0
 ARG ANDROID_NDK=30.0.16248370
 
 ENV JAVA_HOME=/opt/java/openjdk \
@@ -33,7 +34,7 @@ RUN curl -fsSLo /tmp/cmdline-tools.zip "https://dl.google.com/android/repository
  && mv /tmp/cmdline-tools "${ANDROID_HOME}/cmdline-tools/latest" \
  && rm /tmp/cmdline-tools.zip \
  && (yes || true) | sdkmanager --licenses > /dev/null \
- && sdkmanager platform-tools "platforms;android-${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK}" > /dev/null
+ && sdkmanager platform-tools $(printf 'platforms;android-%s ' ${ANDROID_PLATFORMS}) "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK}" > /dev/null
 
 COPY --from=rust ${RUSTUP_HOME} ${RUSTUP_HOME}
 COPY --from=rust ${CARGO_HOME} ${CARGO_HOME}
