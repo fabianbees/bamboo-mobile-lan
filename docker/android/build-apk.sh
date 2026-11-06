@@ -17,6 +17,7 @@ if [[ -n ${KEYSTORE_BASE64:-} ]]; then
     --ks-key-alias "$KEY_ALIAS" \
     --ks-pass env:STORE_PASSWORD \
     --key-pass env:KEY_PASSWORD \
+    --v4-signing-enabled false \
     --out "/out/bamboo-mobile-$version.apk" \
     "$unsigned"
 else
