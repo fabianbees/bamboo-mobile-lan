@@ -935,6 +935,10 @@ async fn camera_loop(ip: String, access_code: String, app: AppHandle) {
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
+// rumqttc drops larger packets and reconnects; full reports from printers such
+// as the X2D exceed its default limit.
+const MQTT_MAX_PACKET_SIZE: usize = 256 * 1024;
+
 #[tauri::command]
 async fn connect_printer(
     ip: String,
@@ -957,6 +961,7 @@ async fn connect_printer(
     let mut opts = MqttOptions::new("bamboo-mobile-lan", &ip, 8883);
     opts.set_credentials("bblp", &access_code);
     opts.set_keep_alive(std::time::Duration::from_secs(10));
+    opts.set_max_packet_size(MQTT_MAX_PACKET_SIZE, MQTT_MAX_PACKET_SIZE);
     opts.set_transport(Transport::Tls(TlsConfiguration::Rustls(Arc::new(tls_cfg))));
 
     let (mqtt_client, mut eventloop) = AsyncClient::new(opts, 64);
