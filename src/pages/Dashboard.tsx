@@ -36,7 +36,7 @@ export default function Dashboard({
 }) {
   // status and frameData come from the shared context — always populated even
   // after navigating away and back, so there's no loading flash on re-mount.
-  const { status, frameData, refresh } = usePrinter();
+  const { status, frameData, cameraError, refresh } = usePrinter();
 
   const [printPreview, setPrintPreview] = useState<string | null>(null);
   const [lightOn, setLightOn] = useState(false);
@@ -44,6 +44,7 @@ export default function Dashboard({
   const [popupCodes, setPopupCodes] = useState<string[]>([]);
   const [selectedTrayId, setSelectedTrayId] = useState<number | null>(null);
   const [filamentBusy, setFilamentBusy] = useState(false);
+  const [liveViewError, setLiveViewError] = useState<string | null>(null);
   const lightPendingUntil = useRef(0);
   const speedPendingUntil = useRef(0);
   const previewJobRef = useRef('');
@@ -214,7 +215,24 @@ export default function Dashboard({
           )}
 
           <div className='rounded-xl overflow-hidden bg-zinc-900 aspect-video flex items-center justify-center shrink-0'>
-            {frameData ?
+            {status?.camera.kind === 'rtsp' ?
+              <button
+                onClick={() => {
+                  setLiveViewError(null);
+                  invoke('open_live_view').catch((e) =>
+                    setLiveViewError(String(e)),
+                  );
+                }}
+                className='w-full h-full flex flex-col items-center justify-center gap-2 text-center px-6 active:bg-zinc-800'>
+                <span className='text-3xl'>▶️</span>
+                <p className='text-zinc-300 text-sm font-medium'>
+                  Open live view
+                </p>
+                <p className='text-zinc-600 text-xs'>
+                  {liveViewError ?? 'Full screen, RTSPS stream'}
+                </p>
+              </button>
+            : frameData ?
               <img
                 src={frameData}
                 className='w-full h-full object-cover'
@@ -226,7 +244,7 @@ export default function Dashboard({
                   Connecting to camera…
                 </p>
                 <p className='text-zinc-600 text-xs'>
-                  Waiting for stream on port 6000
+                  {cameraError ?? 'Waiting for stream on port 6000'}
                 </p>
               </div>
             }

@@ -10,9 +10,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State as TauriState};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::{MappedMutexGuard, Mutex, MutexGuard},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    sync::{watch, MappedMutexGuard, Mutex, MutexGuard},
     task::AbortHandle,
+    time::timeout,
 };
 
 mod ftp;
@@ -100,6 +101,19 @@ pub struct PrinterStatus {
     /// Global slot ID of the tray currently loaded in the nozzle.
     /// 255 = nothing loaded, 254 = external spool, 0-15 = AMS slots.
     pub tray_now: u8,
+    pub camera: Camera,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Camera {
+    /// No status report yet.
+    #[default]
+    Unknown,
+    /// JPEG frames over TLS on port 6000.
+    Jpeg,
+    /// RTSPS stream, played by the Android app's live view.
+    Rtsp { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -146,6 +160,9 @@ impl Default for AmsTray {
 /// `app.try_state::<PrintNotifHandle>()` inside the MQTT task.
 #[cfg(mobile)]
 pub(crate) struct PrintNotifHandle(pub tauri::plugin::PluginHandle<tauri::Wry>);
+
+#[cfg(mobile)]
+pub(crate) struct LiveViewHandle(pub tauri::plugin::PluginHandle<tauri::Wry>);
 
 /// Payload for startNotification / updateNotification commands.
 #[cfg(mobile)]
@@ -371,6 +388,23 @@ fn parse_status(payload: &[u8], status: &mut PrinterStatus) {
                 status.chamber_light = light.get("mode").and_then(|v| v.as_str()) == Some("on");
             }
         }
+    }
+
+    // A1/P1 report no RTSPS URL; RTSPS printers report "disable" while LAN liveview is off.
+    let rtsp_url = p
+        .get("ipcam")
+        .and_then(|c| c.get("rtsp_url"))
+        .and_then(|v| v.as_str());
+    let full_report = p.get("command").and_then(|v| v.as_str()) == Some("push_status");
+    match rtsp_url {
+        Some(url) if url.starts_with("rtsp") => {
+            status.camera = Camera::Rtsp {
+                url: url.to_owned(),
+            }
+        }
+        Some(_) => status.camera = Camera::Jpeg,
+        None if full_report && status.camera == Camera::Unknown => status.camera = Camera::Jpeg,
+        None => {}
     }
 
     // Bambu firmware sends numeric IDs as JSON strings ("0", "1", …).
@@ -850,9 +884,10 @@ async fn ssdp_multicast_listen(
     }
 }
 
-// ── Camera: MJPG over TLS on port 6000 ───────────────────────────────────────
+// ── Camera ────────────────────────────────────────────────────────────────────
 //
-// Protocol (per OpenBambuAPI/video.md):
+// RTSPS printers are shown by the Android app's LiveViewActivity (open_live_view).
+// The others serve JPEG frames over TLS on port 6000 (per OpenBambuAPI/video.md):
 //   1. TLS connect to <ip>:6000 (self-signed cert, no verification)
 //   2. Send 80-byte auth packet:
 //        [0..3]   u32 LE = 0x40        (payload size)
@@ -862,76 +897,121 @@ async fn ssdp_multicast_listen(
 //        [48..79] 32 bytes: access_code NUL-padded
 //   3. Loop: read 16-byte frame header (payload_size u32 LE, ...) then JPEG.
 
-async fn camera_loop(ip: String, access_code: String, app: AppHandle) {
-    let tls_cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipVerifier))
-            .with_no_client_auth(),
-    );
-    let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+const CAMERA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CAMERA_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_JPEG_FRAME: usize = 1024 * 1024;
 
-    // Derive a ServerName from the IP (no SNI for raw IPs, but verification
-    // is disabled anyway so the printer's self-signed cert is accepted).
-    let server_name: ServerName<'static> = match ip.parse::<std::net::IpAddr>() {
-        Ok(addr) => ServerName::IpAddress(rustls::pki_types::IpAddr::from(addr)),
-        Err(_) => match ServerName::try_from(ip.clone()) {
-            Ok(n) => n,
-            Err(_) => return,
-        },
-    };
+/// Streams port-6000 frames for as long as the printer reports a JPEG camera.
+async fn camera_task(
+    ip: String,
+    access_code: String,
+    mut camera: watch::Receiver<Camera>,
+    app: AppHandle,
+) {
+    loop {
+        let jpeg = matches!(*camera.borrow_and_update(), Camera::Jpeg);
+        if jpeg {
+            tokio::select! {
+                () = jpeg_stream(&ip, &access_code, &app) => {}
+                changed = camera.changed() => if changed.is_err() { return },
+            }
+        } else if camera.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn jpeg_stream(ip: &str, access_code: &str, app: &AppHandle) {
+    let connector = tokio_rustls::TlsConnector::from(lan_tls_config());
+    loop {
+        if let Err(e) = jpeg_session(&connector, ip, access_code, app).await {
+            let _ = app.emit("camera-error", e);
+        }
+        tokio::time::sleep(CAMERA_RETRY).await;
+    }
+}
+
+async fn jpeg_session(
+    connector: &tokio_rustls::TlsConnector,
+    ip: &str,
+    access_code: &str,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let server_name = ServerName::try_from(ip.to_owned()).map_err(|e| format!("{ip}: {e}"))?;
+    let tcp = timeout(CAMERA_TIMEOUT, tokio::net::TcpStream::connect((ip, 6000)))
+        .await
+        .map_err(|_| "camera connect timed out".to_string())?
+        .map_err(|e| format!("camera connect: {e}"))?;
+    let mut tls = timeout(CAMERA_TIMEOUT, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| "camera TLS handshake timed out".to_string())?
+        .map_err(|e| format!("camera TLS: {e}"))?;
+    tls.write_all(&jpeg_auth_packet(access_code))
+        .await
+        .map_err(|e| format!("camera auth: {e}"))?;
 
     loop {
-        let Ok(stream) = tokio::net::TcpStream::connect(format!("{}:6000", ip)).await else {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        };
-
-        let Ok(mut tls) = connector.connect(server_name.clone(), stream).await else {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        };
-
-        // Build and send 80-byte auth packet
-        let mut auth = [0u8; 80];
-        auth[0..4].copy_from_slice(&0x40u32.to_le_bytes());
-        auth[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
-        let user = b"bblp";
-        auth[16..16 + user.len()].copy_from_slice(user);
-        let pass = access_code.as_bytes();
-        let plen = pass.len().min(32);
-        auth[48..48 + plen].copy_from_slice(&pass[..plen]);
-
-        if tls.write_all(&auth).await.is_err() {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
+        let mut header = [0u8; 16];
+        read_frame_part(&mut tls, &mut header).await?;
+        let size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if size == 0 || size > MAX_JPEG_FRAME {
+            return Err(format!("camera sent a frame of {size} bytes"));
         }
-
-        // Read frames until error or disconnect
-        loop {
-            let mut hdr = [0u8; 16];
-            if tls.read_exact(&mut hdr).await.is_err() {
-                break;
-            }
-
-            let payload_size = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
-            if payload_size == 0 || payload_size > 1_048_576 {
-                break;
-            }
-
-            let mut frame = vec![0u8; payload_size];
-            if tls.read_exact(&mut frame).await.is_err() {
-                break;
-            }
-
-            // Validate JPEG start-of-image marker
-            if payload_size >= 2 && frame[0] == 0xFF && frame[1] == 0xD8 {
-                let b64 = STANDARD.encode(&frame);
-                let _ = app.emit("camera-frame", b64);
-            }
+        let mut frame = vec![0u8; size];
+        read_frame_part(&mut tls, &mut frame).await?;
+        if frame.starts_with(&[0xFF, 0xD8]) {
+            let _ = app.emit("camera-frame", STANDARD.encode(&frame));
         }
+    }
+}
 
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+async fn read_frame_part<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<(), String> {
+    timeout(CAMERA_TIMEOUT, r.read_exact(buf))
+        .await
+        .map_err(|_| "camera sent no frame".to_string())?
+        .map(|_| ())
+        .map_err(|e| format!("camera read: {e}"))
+}
+
+fn jpeg_auth_packet(access_code: &str) -> [u8; 80] {
+    let mut auth = [0u8; 80];
+    auth[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+    auth[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
+    auth[16..20].copy_from_slice(b"bblp");
+    let code = &access_code.as_bytes()[..access_code.len().min(32)];
+    auth[48..48 + code.len()].copy_from_slice(code);
+    auth
+}
+
+#[tauri::command]
+async fn open_live_view(app: AppHandle, state: TauriState<'_, AppState>) -> Result<(), String> {
+    let (url, access_code) = {
+        let conn = state.connection.lock().await;
+        let c = conn.as_ref().ok_or("Not connected")?;
+        let Camera::Rtsp { url } = c.status.lock().await.camera.clone() else {
+            return Err("The printer reports no RTSPS camera stream".into());
+        };
+        (url, c.access_code.clone())
+    };
+
+    #[cfg(mobile)]
+    {
+        let plugin = app
+            .try_state::<LiveViewHandle>()
+            .ok_or("Live view plugin not available")?;
+        plugin
+            .0
+            .run_mobile_plugin::<serde_json::Value>(
+                "open",
+                serde_json::json!({ "url": url, "access_code": access_code }),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(mobile))]
+    {
+        let _ = (app, url, access_code);
+        Err("The live view needs the Android app".into())
     }
 }
 
@@ -1002,6 +1082,8 @@ async fn connect_printer(
     let status = Arc::new(Mutex::new(PrinterStatus::default()));
     let mut abort_handles: Vec<AbortHandle> = Vec::new();
 
+    let (camera_tx, camera_rx) = watch::channel(Camera::Unknown);
+
     // MQTT event loop task
     let status_c = status.clone();
     let app_c = app.clone();
@@ -1066,6 +1148,13 @@ async fn connect_printer(
                         st.clone()
                     }; // MutexGuard dropped here
                     let _ = app_c.emit("printer-status", &st_snapshot);
+                    camera_tx.send_if_modified(|camera| {
+                        let changed = *camera != st_snapshot.camera;
+                        if changed {
+                            *camera = st_snapshot.camera.clone();
+                        }
+                        changed
+                    });
                     // Drive the foreground-service notification directly from Rust
                     // so it keeps updating even when the WebView is suspended.
                     #[cfg(mobile)]
@@ -1089,8 +1178,12 @@ async fn connect_printer(
     abort_handles.push(handle.abort_handle());
     drop(handle);
 
-    // Camera: MJPG over TLS on port 6000
-    let camera_handle = tokio::spawn(camera_loop(ip.clone(), access_code.clone(), app.clone()));
+    let camera_handle = tokio::spawn(camera_task(
+        ip.clone(),
+        access_code.clone(),
+        camera_rx,
+        app.clone(),
+    ));
     abort_handles.push(camera_handle.abort_handle());
     drop(camera_handle);
 
@@ -1749,6 +1842,23 @@ pub fn run() {
             .build(),
     );
 
+    #[cfg(mobile)]
+    let builder = builder.plugin(
+        tauri::plugin::Builder::<tauri::Wry, ()>::new("liveView")
+            .setup(|app, api| {
+                match api.register_android_plugin("com.joelsgc.bamboomobilelan", "LiveViewPlugin") {
+                    Ok(handle) => {
+                        app.manage(LiveViewHandle(handle));
+                    }
+                    Err(e) => {
+                        eprintln!("[LiveView] register_android_plugin failed: {:?}", e);
+                    }
+                }
+                Ok(())
+            })
+            .build(),
+    );
+
     builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
@@ -1777,6 +1887,7 @@ pub fn run() {
             start_print,
             load_filament,
             unload_filament,
+            open_live_view,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

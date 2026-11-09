@@ -19,6 +19,8 @@ interface PrinterContextValue {
   status: PrinterStatus | null;
   /** Latest camera frame as a data-URI, null until first frame arrives. */
   frameData: string | null;
+  /** Why the port-6000 camera stream last failed, null once a frame arrives. */
+  cameraError: string | null;
   /** Re-fetch status from the Rust side (e.g. pull-to-refresh). */
   refresh: () => Promise<void>;
 }
@@ -28,6 +30,7 @@ interface PrinterContextValue {
 const PrinterContext = createContext<PrinterContextValue>({
   status: null,
   frameData: null,
+  cameraError: null,
   refresh: async () => {},
 });
 
@@ -118,6 +121,7 @@ function buildNotifBody(s: PrinterStatus): string {
 export function PrinterProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<PrinterStatus | null>(null);
   const [frameData, setFrameData] = useState<string | null>(null);
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   // Stable reference so consumers (PullToRefresh etc.) don't re-render when
   // the component re-renders for unrelated reasons.
@@ -213,21 +217,26 @@ export function PrinterProvider({ children }: { children: ReactNode }) {
     const unlistenStatus = listen<PrinterStatus>('printer-status', (e) =>
       setStatus(e.payload),
     );
-    const unlistenCamera = listen<string>('camera-frame', (e) =>
-      setFrameData(`data:image/jpeg;base64,${e.payload}`),
+    const unlistenCamera = listen<string>('camera-frame', (e) => {
+      setFrameData(`data:image/jpeg;base64,${e.payload}`);
+      setCameraError(null);
+    });
+    const unlistenCameraError = listen<string>('camera-error', (e) =>
+      setCameraError(e.payload),
     );
 
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
       unlistenStatus.then((f) => f());
       unlistenCamera.then((f) => f());
+      unlistenCameraError.then((f) => f());
       // Clean up notification if the provider is ever torn down mid-print.
       notifStop();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <PrinterContext.Provider value={{ status, frameData, refresh }}>
+    <PrinterContext.Provider value={{ status, frameData, cameraError, refresh }}>
       {children}
     </PrinterContext.Provider>
   );

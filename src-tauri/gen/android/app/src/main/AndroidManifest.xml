@@ -60,6 +60,11 @@
             <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
+        <activity
+            android:name=".LiveViewActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:exported="false" />
+
         <!--
           PrinterForegroundService keeps the process alive while a print is
           running so the Rust MQTT loop continues to receive status updates

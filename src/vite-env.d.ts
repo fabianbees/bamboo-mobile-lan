@@ -24,6 +24,12 @@ export interface AmsUnit {
   trays: AmsTray[];
 }
 
+/** How the printer serves its camera; `unknown` until the first status report. */
+export type Camera =
+  | { kind: 'unknown' }
+  | { kind: 'jpeg' }
+  | { kind: 'rtsp'; url: string };
+
 export interface PrinterStatus {
   nozzle_temp: number;
   nozzle_target: number;
@@ -45,4 +51,5 @@ export interface PrinterStatus {
   device_name: string;
   /** Global slot ID of the tray currently loaded in the nozzle. 255 = none, 254 = external. */
   tray_now: number;
+  camera: Camera;
 }

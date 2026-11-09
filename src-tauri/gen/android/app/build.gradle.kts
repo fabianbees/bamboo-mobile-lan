@@ -74,6 +74,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.lifecycle:lifecycle-process:2.11.0")
+    // RTSPS camera stream of the X1/H2/X2 series (LiveViewActivity).
+    implementation("androidx.media3:media3-exoplayer:1.11.1")
+    implementation("androidx.media3:media3-exoplayer-rtsp:1.11.1")
+    implementation("androidx.media3:media3-ui:1.11.1")
     // Standalone MQTT client used by PrinterForegroundService when the Tauri
     // process is not running (e.g. after the user swipes the app away).
     // This is the core v3 client — NOT the deprecated Android Service wrapper.

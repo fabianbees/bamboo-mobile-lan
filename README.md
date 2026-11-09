@@ -39,7 +39,7 @@ Projects like [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI) document 
 ## Features
 
 - 🔄 **Multiple Printer Support** — switch between printers, automatic local network name detection, and per-printer credential storage.
-- 📷 **Live camera feed** — MJPG over TLS on port 6000, pure Rust implementation.
+- 📷 **Live camera feed** — A1/P1: JPEG over TLS on port 6000, shown in the dashboard. X1/H2/X2: RTSPS stream in a full-screen live view (Android only, Media3 ExoPlayer); switch on LAN liveview on the printer.
 - 📊 **Print status & Controls** — view progress %, layer counter, remaining time, and start (pre-uploaded gcode), pause, resume, or stop prints.
 - 🗂️ **File Manager & Timelapses** — FTP (port 990) integration to view, download, delete files, and view model previews.
 - 🔔 **App Notifications** — push alerts for print completion and failures.
@@ -119,7 +119,8 @@ You'll need your printer's **IP address**, **access code** (touchscreen → Sett
 
 For anyone building on top of this:
 
-- **Camera**: TLS on port 6000. Send an 80-byte auth packet (`0x40` LE size, `0x3000` LE type, `"bblp"` at offset 16, access code at offset 48), then read 16-byte frame headers followed by raw JPEG data.
+- **Camera (X1/H2/X2)**: RTSPS (H.264) on port 322, credentials `bblp` / `<access_code>`. The printer reports the URL in `print.ipcam.rtsp_url`, or `"disable"` while LAN liveview is off.
+- **Camera (A1/P1)**: TLS on port 6000. Send an 80-byte auth packet (`0x40` LE size, `0x3000` LE type, `"bblp"` at offset 16, access code at offset 48), then read 16-byte frame headers followed by raw JPEG data.
 - **MQTT**: TLS on port 8883, credentials `bblp` / `<access_code>`. Subscribe to `device/<serial>/report`, publish to `device/<serial>/request`.
 - **TLS**: Bambu printers use self-signed certificates — skip verification.
 - Full protocol documentation: [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI)
