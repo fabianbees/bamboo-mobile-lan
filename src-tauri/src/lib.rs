@@ -7,14 +7,16 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::io::{Read, Write};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State as TauriState};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex,
+    sync::{MappedMutexGuard, Mutex, MutexGuard},
     task::AbortHandle,
 };
+
+mod ftp;
+use ftp::FileEntry;
 
 // ── TLS: accept any certificate (Bambu printers use self-signed) ─────────────
 
@@ -62,6 +64,15 @@ impl ServerCertVerifier for SkipVerifier {
             SignatureScheme::ED25519,
         ]
     }
+}
+
+pub(crate) fn lan_tls_config() -> Arc<rustls::ClientConfig> {
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipVerifier))
+            .with_no_client_auth(),
+    )
 }
 
 // ── Printer status types (mirrored in vite-env.d.ts) ─────────────────────────
@@ -279,9 +290,8 @@ fn drive_notification(
 
 pub(crate) struct AppState {
     pub(crate) connection: Mutex<Option<ConnectionHandles>>,
-    // Persistent FTPS control connection — reused across all FTP commands so we
-    // pay the TCP+TLS+auth overhead only once instead of once per operation.
-    pub(crate) ftp: Arc<std::sync::Mutex<Option<FtpsConn>>>,
+    // Kept open across commands so TCP, TLS and login are paid once.
+    pub(crate) ftp: Mutex<Option<ftp::Ftp>>,
 }
 
 struct ConnectionHandles {
@@ -291,14 +301,6 @@ struct ConnectionHandles {
     mqtt_client: AsyncClient,
     abort_handles: Vec<AbortHandle>,
     status: Arc<Mutex<PrinterStatus>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct FileEntry {
-    pub name: String,
-    pub size: u64,
-    pub is_dir: bool,
-    pub modified: i64, // sortable: YYYYMMDD (year*10000 + month*100 + day)
 }
 
 // ── MQTT payload parsing ──────────────────────────────────────────────────────
@@ -1127,17 +1129,9 @@ async fn connect_printer(
 
 #[tauri::command]
 async fn disconnect_printer(_app: AppHandle, state: TauriState<'_, AppState>) -> Result<(), String> {
-    // Close the persistent FTP control connection
-    let ftp_arc = Arc::clone(&state.ftp);
-    tokio::task::spawn_blocking(move || {
-        if let Ok(mut slot) = ftp_arc.lock() {
-            if let Some(mut conn) = slot.take() {
-                ftp_writeln(&mut conn.stream, "QUIT").ok();
-            }
-        }
-    })
-    .await
-    .ok();
+    if let Some(mut session) = state.ftp.lock().await.take() {
+        ftp::quit(&mut session).await;
+    }
 
     let mut conn = state.connection.lock().await;
     if let Some(c) = conn.take() {
@@ -1240,118 +1234,28 @@ async fn printer_command(command: String, state: TauriState<'_, AppState>) -> Re
         .map_err(|e| e.to_string())
 }
 
-// ── FTPS file manager (implicit TLS, port 990) ───────────────────────────────
-// Minimal FTPS over rustls — no third-party FTP library, consistent with the
-// existing SkipVerifier setup used for MQTT and the camera stream.
+// ── File manager (FTPS, see ftp.rs) ──────────────────────────────────────────
 
-type FtpsStream = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
-
-struct FtpsConn {
-    stream: FtpsStream,
+async fn printer_credentials(state: &AppState) -> Result<(String, String), String> {
+    let conn = state.connection.lock().await;
+    let c = conn.as_ref().ok_or("Not connected")?;
+    Ok((c.ip.clone(), c.access_code.clone()))
 }
 
-// Returns a live FTP control stream, reconnecting transparently if the server
-// closed the connection while we were idle.
-fn ensure_ftp<'a>(
-    slot: &'a mut Option<FtpsConn>,
-    ip: &str,
-    access_code: &str,
-) -> Result<&'a mut FtpsStream, String> {
-    let alive = slot
-        .as_mut()
-        .map(|c| {
-            ftp_writeln(&mut c.stream, "NOOP").is_ok()
-                && ftp_read_response(&mut c.stream)
-                    .map(|(code, _)| code == 200)
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    if !alive {
-        *slot = Some(FtpsConn {
-            stream: ftps_connect(ip, access_code)?,
-        });
-    }
-    Ok(&mut slot.as_mut().unwrap().stream)
+async fn ftp_session(state: &AppState) -> Result<MappedMutexGuard<'_, ftp::Ftp>, String> {
+    let (ip, access_code) = printer_credentials(state).await?;
+    let mut slot = state.ftp.lock().await;
+    ftp::ensure_session(&mut slot, &ip, &access_code).await?;
+    Ok(MutexGuard::map(slot, |s| {
+        s.as_mut().expect("ensure_session leaves a session")
+    }))
 }
 
-// Tries to RETR a single path. Returns Ok(Some(bytes)) on success,
-// Ok(None) if the file doesn't exist (550), Err on a control-channel failure.
-fn ftp_try_retr(ctrl: &mut FtpsStream, ip: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
-    let data_addr = ftp_pasv(ctrl, ip)?;
-    ftp_writeln(ctrl, &format!("RETR {}", path))?;
-
-    let data_tcp = match std::net::TcpStream::connect(data_addr) {
-        Ok(s) => s,
-        Err(_) => {
-            ftp_read_response(ctrl).ok();
-            return Ok(None);
-        }
-    };
-    data_tcp
-        .set_read_timeout(Some(std::time::Duration::from_secs(15)))
-        .ok();
-    let mut data = match ftps_tls_stream(ip, data_tcp) {
-        Ok(s) => s,
-        Err(_) => {
-            ftp_read_response(ctrl).ok();
-            return Ok(None);
-        }
-    };
-
-    let (code, _) = ftp_read_response(ctrl)?;
-    if code != 125 && code != 150 {
-        drop(data);
-        return Ok(None);
+async fn write_cache(path: &std::path::Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
     }
-
-    let mut bytes = Vec::new();
-    data.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    drop(data);
-    ftp_read_response(ctrl).ok();
-    Ok(Some(bytes))
-}
-
-// Downloads the first `max_bytes` of a remote file. If EOF is reached before
-// the limit the 226 response is consumed cleanly; if we hit the limit first we
-// force-close the data connection (ensure_ftp will reconnect the control channel
-// on the next call via its NOOP health-check).
-fn ftp_read_partial(
-    ctrl: &mut FtpsStream,
-    ip: &str,
-    path: &str,
-    max_bytes: usize,
-) -> Result<Vec<u8>, String> {
-    let data_addr = ftp_pasv(ctrl, ip)?;
-    ftp_writeln(ctrl, &format!("RETR {}", path))?;
-
-    let data_tcp =
-        std::net::TcpStream::connect(data_addr).map_err(|e| format!("Data connect: {}", e))?;
-    data_tcp
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .ok();
-    let mut data = ftps_tls_stream(ip, data_tcp)?;
-
-    let (code, msg) = ftp_read_response(ctrl)?;
-    if code != 125 && code != 150 {
-        return Err(format!("RETR: {} {}", code, msg));
-    }
-
-    let mut buf = Vec::with_capacity(max_bytes.min(65_536));
-    let mut chunk = [0u8; 8_192];
-    loop {
-        let n = data.read(&mut chunk).map_err(|e| e.to_string())?;
-        if n == 0 {
-            drop(data);
-            ftp_read_response(ctrl).ok(); // 226 — clean EOF
-            return Ok(buf);
-        }
-        let space = max_bytes - buf.len();
-        buf.extend_from_slice(&chunk[..n.min(space)]);
-        if buf.len() >= max_bytes {
-            drop(data); // force-close; control conn cleaned up by next ensure_ftp NOOP
-            return Ok(buf);
-        }
-    }
+    let _ = tokio::fs::write(path, bytes).await;
 }
 
 // Parses the largest embedded thumbnail from a gcode header.
@@ -1411,211 +1315,13 @@ fn detect_mime(bytes: &[u8]) -> &'static str {
     }
 }
 
-fn ftps_tls_stream(ip: &str, tcp: std::net::TcpStream) -> Result<FtpsStream, String> {
-    let cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipVerifier))
-            .with_no_client_auth(),
-    );
-    let name: rustls::pki_types::ServerName<'static> = match ip.parse::<std::net::IpAddr>() {
-        Ok(a) => rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(a)),
-        Err(_) => rustls::pki_types::ServerName::try_from(ip.to_owned())
-            .map_err(|_| format!("Invalid hostname: {}", ip))?,
-    };
-    let conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
-    Ok(rustls::StreamOwned::new(conn, tcp))
-}
-
-fn ftp_writeln(s: &mut impl Write, cmd: &str) -> Result<(), String> {
-    s.write_all(format!("{}\r\n", cmd).as_bytes())
-        .map_err(|e| e.to_string())
-}
-
-fn ftp_read_response(s: &mut impl Read) -> Result<(u16, String), String> {
-    loop {
-        let mut line = Vec::new();
-        let mut b = [0u8; 1];
-        loop {
-            s.read_exact(&mut b).map_err(|e| e.to_string())?;
-            if b[0] == b'\n' {
-                break;
-            }
-            if b[0] != b'\r' {
-                line.push(b[0]);
-            }
-        }
-        let line = String::from_utf8_lossy(&line).into_owned();
-        if line.len() >= 4 {
-            if let Ok(code) = line[..3].parse::<u16>() {
-                if line.as_bytes().get(3) == Some(&b' ') {
-                    return Ok((code, line[4..].to_owned()));
-                }
-                // dash = multiline continuation — keep reading
-            }
-        }
-    }
-}
-
-// Returns the data-channel address using the *control* IP + the port from PASV.
-// Ignoring the PASV-advertised IP avoids failures when the printer reports a
-// different interface address (e.g. wlan0 vs eth0) than the one we connected to.
-fn ftp_pasv(s: &mut FtpsStream, server_ip: &str) -> Result<std::net::SocketAddr, String> {
-    ftp_writeln(s, "PASV")?;
-    let (code, msg) = ftp_read_response(s)?;
-    if code != 227 {
-        return Err(format!("PASV failed: {}", msg));
-    }
-    let start = msg.find('(').ok_or("Invalid PASV response")?;
-    let end = msg.find(')').ok_or("Invalid PASV response")?;
-    let n: Vec<u16> = msg[start + 1..end]
-        .split(',')
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
-    if n.len() != 6 {
-        return Err("PASV parse error".into());
-    }
-    let port = n[4] * 256 + n[5];
-    format!("{}:{}", server_ip, port)
-        .parse()
-        .map_err(|e: std::net::AddrParseError| e.to_string())
-}
-
-fn ftps_connect(ip: &str, access_code: &str) -> Result<FtpsStream, String> {
-    let tcp = std::net::TcpStream::connect(format!("{}:990", ip))
-        .map_err(|e| format!("FTP connect: {}", e))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(15)))
-        .ok();
-    tcp.set_write_timeout(Some(std::time::Duration::from_secs(15)))
-        .ok();
-
-    let mut s = ftps_tls_stream(ip, tcp)?;
-
-    ftp_read_response(&mut s)?; // 220 welcome
-
-    ftp_writeln(&mut s, "USER bblp")?;
-    ftp_read_response(&mut s)?; // 331
-    ftp_writeln(&mut s, &format!("PASS {}", access_code))?;
-    let (code, msg) = ftp_read_response(&mut s)?;
-    if code != 230 {
-        return Err(format!("FTP login failed: {} {}", code, msg));
-    }
-
-    ftp_writeln(&mut s, "PBSZ 0")?;
-    ftp_read_response(&mut s)?;
-    ftp_writeln(&mut s, "PROT P")?;
-    ftp_read_response(&mut s)?;
-    ftp_writeln(&mut s, "TYPE I")?;
-    ftp_read_response(&mut s)?; // binary mode for image/video transfers
-
-    Ok(s)
-}
-
-fn month_num(m: &str) -> i64 {
-    match m {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => 0,
-    }
-}
-
-fn parse_list_entry(line: &str) -> Option<FileEntry> {
-    // Unix listing: permissions links owner group size month day time-or-year name…
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 9 {
-        return None;
-    }
-    let is_dir = parts[0].starts_with('d');
-    let size: u64 = parts[4].parse().ok()?;
-    let month = month_num(parts[5]);
-    let day: i64 = parts[6].parse().unwrap_or(0);
-    // parts[7] is either "HH:MM" (recent file, year omitted) or "YYYY" (older file)
-    let (year, hhmm): (i64, i64) = if parts[7].contains(':') {
-        let cur_year = 1970
-            + (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                / 31_557_600) as i64;
-        let mut p = parts[7].splitn(2, ':');
-        let h: i64 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let m: i64 = p.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (cur_year, h * 100 + m)
-    } else {
-        (parts[7].parse().unwrap_or(2026), 0)
-    };
-    // Encode as YYYYMMDDHHmm so the value sorts newest-highest
-    let modified = year * 100_000_000 + month * 1_000_000 + day * 10_000 + hhmm;
-    let name = parts[8..].join(" ");
-    if name == "." || name == ".." || name.is_empty() {
-        return None;
-    }
-    Some(FileEntry {
-        name,
-        size,
-        is_dir,
-        modified,
-    })
-}
-
 #[tauri::command]
 async fn list_files(
     path: String,
     state: TauriState<'_, AppState>,
 ) -> Result<Vec<FileEntry>, String> {
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
-    tokio::task::spawn_blocking(move || -> Result<Vec<FileEntry>, String> {
-        let mut slot = ftp_arc.lock().unwrap();
-        let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-
-        let data_addr = ftp_pasv(ctrl, &ip)?;
-        ftp_writeln(ctrl, &format!("LIST {}", path))?;
-
-        let data_tcp =
-            std::net::TcpStream::connect(data_addr).map_err(|e| format!("Data connect: {}", e))?;
-        data_tcp
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
-        let mut data = ftps_tls_stream(&ip, data_tcp)?;
-
-        let (code, msg) = ftp_read_response(ctrl)?;
-        if code != 125 && code != 150 {
-            return Err(format!("LIST error: {} {}", code, msg));
-        }
-
-        let mut listing = String::new();
-        data.read_to_string(&mut listing)
-            .map_err(|e| e.to_string())?;
-        drop(data);
-        ftp_read_response(ctrl).ok(); // 226 transfer complete
-
-        let mut entries: Vec<FileEntry> = listing.lines().filter_map(parse_list_entry).collect();
-        entries.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then(b.modified.cmp(&a.modified))
-                .then(a.name.cmp(&b.name))
-        });
-        Ok(entries)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let mut ftp = ftp_session(&state).await?;
+    ftp::list(&mut ftp, &path).await
 }
 
 #[tauri::command]
@@ -1624,61 +1330,25 @@ async fn fetch_thumbnail(
     app: AppHandle,
     state: TauriState<'_, AppState>,
 ) -> Result<String, String> {
-    // Serve from disk cache when available
     let file_name = std::path::Path::new(&path)
         .file_name()
         .ok_or("invalid path")?
         .to_owned();
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     let cache_path = cache_dir.join("thumbnails").join(&file_name);
-
-    if cache_path.exists() {
-        let bytes = std::fs::read(&cache_path).map_err(|e| e.to_string())?;
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
         return Ok(STANDARD.encode(&bytes));
     }
 
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut slot = ftp_arc.lock().unwrap();
-        let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-
-        let data_addr = ftp_pasv(ctrl, &ip)?;
-        ftp_writeln(ctrl, &format!("RETR {}", path))?;
-
-        let data_tcp =
-            std::net::TcpStream::connect(data_addr).map_err(|e| format!("Data connect: {}", e))?;
-        data_tcp
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .ok();
-        let mut data = ftps_tls_stream(&ip, data_tcp)?;
-
-        let (code, msg) = ftp_read_response(ctrl)?;
-        if code != 125 && code != 150 {
-            return Err(format!("RETR: {} {}", code, msg));
-        }
-
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        drop(data);
-        ftp_read_response(ctrl).ok();
-
-        // Persist to cache for future visits
-        if let Some(parent) = cache_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&cache_path, &bytes).ok();
-
-        Ok(STANDARD.encode(&bytes))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let mut ftp = ftp_session(&state).await?;
+    let bytes = ftp::read(&mut ftp, &path, usize::MAX)
+        .await?
+        .ok_or_else(|| format!("{path}: not found"))?;
+    write_cache(&cache_path, &bytes).await;
+    Ok(STANDARD.encode(&bytes))
 }
+
+const PREVIEW_HEADER_BYTES: usize = 2 * 1024 * 1024;
 
 #[tauri::command]
 async fn fetch_print_preview(
@@ -1691,176 +1361,76 @@ async fn fetch_print_preview(
         return Err("No active job".to_string());
     }
 
-    // Cache is stored without extension; MIME is detected from magic bytes on read-back.
+    // Cached without extension; the MIME type is detected from the magic bytes.
     let cache_dir = app.path().app_cache_dir().map_err(|e| e.to_string())?;
     let cache_path = cache_dir.join("previews").join(&subtask_name);
-    if cache_path.exists() {
-        let bytes = std::fs::read(&cache_path).map_err(|e| e.to_string())?;
-        return Ok(format!(
-            "data:{};base64,{}",
-            detect_mime(&bytes),
-            STANDARD.encode(&bytes)
-        ));
+    let bytes = match tokio::fs::read(&cache_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let mut ftp = ftp_session(&state).await?;
+            let bytes = find_print_preview(&mut ftp, &subtask_name, &task_id).await?;
+            write_cache(&cache_path, &bytes).await;
+            bytes
+        }
+    };
+    Ok(format!(
+        "data:{};base64,{}",
+        detect_mime(&bytes),
+        STANDARD.encode(&bytes)
+    ))
+}
+
+/// Tries the cloud task's image, the newest file in /image/ (where OrcaSlicer puts the
+/// preview of a LAN print), a pre-rendered image in /cache/, then the thumbnail embedded in
+/// the job's gcode header.
+async fn find_print_preview(
+    ftp: &mut ftp::Ftp,
+    subtask_name: &str,
+    task_id: &str,
+) -> Result<Vec<u8>, String> {
+    let mut tried = Vec::new();
+    let mut images = Vec::new();
+    // LAN prints report task_id "0".
+    if !task_id.is_empty() && task_id != "0" {
+        images.extend(["png", "jpg", "jpeg"].map(|ext| format!("/image/{task_id}.{ext}")));
+    }
+    match ftp::list(ftp, "/image/").await {
+        Ok(entries) => images.extend(
+            entries
+                .into_iter()
+                .filter(|e| !e.is_dir)
+                .max_by_key(|e| e.modified)
+                .map(|e| format!("/image/{}", e.name)),
+        ),
+        Err(e) => tried.push(e),
+    }
+    images.extend(["jpg", "jpeg", "png"].map(|ext| format!("/cache/{subtask_name}.{ext}")));
+    for path in &images {
+        match ftp::read(ftp, path, usize::MAX).await {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => tried.push(format!("{path}: not found")),
+            Err(e) => tried.push(e),
+        }
     }
 
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut diag: Vec<String> = Vec::new();
-        let mut slot = ftp_arc.lock().unwrap();
-
-        // ── 1. Try /image/ — list the directory and fetch the most recently modified file.
-        //       OrcaSlicer uploads the preview image here when sending a print via LAN,
-        //       so the newest entry corresponds to the active job.
-        //       If task_id is a non-zero cloud ID, also try exact match first.
-        {
-            // Exact match by task_id (cloud prints only; LAN prints have task_id = "0")
-            if !task_id.is_empty() && task_id != "0" {
-                let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-                for ext in &["png", "jpg", "jpeg"] {
-                    let path = format!("/image/{}.{}", task_id, ext);
-                    match ftp_try_retr(ctrl, &ip, &path) {
-                        Ok(Some(bytes)) => {
-                            if let Some(p) = cache_path.parent() {
-                                std::fs::create_dir_all(p).ok();
-                            }
-                            std::fs::write(&cache_path, &bytes).ok();
-                            return Ok(format!(
-                                "data:{};base64,{}",
-                                detect_mime(&bytes),
-                                STANDARD.encode(&bytes)
-                            ));
-                        }
-                        Ok(None) => diag.push(format!("{path}: 550")),
-                        Err(e) => diag.push(format!("{path}: err({e})")),
-                    }
-                }
-            }
-
-            // List /image/ and pick the newest file
-            let newest: Option<String> = {
-                let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-                let data_addr = ftp_pasv(ctrl, &ip)?;
-                ftp_writeln(ctrl, "LIST /image/")?;
-                let data_tcp = std::net::TcpStream::connect(data_addr)
-                    .map_err(|e| format!("image-list data: {}", e))?;
-                data_tcp
-                    .set_read_timeout(Some(std::time::Duration::from_secs(15)))
-                    .ok();
-                let mut data = ftps_tls_stream(&ip, data_tcp)?;
-                let (code, _) = ftp_read_response(ctrl)?;
-                if code == 125 || code == 150 {
-                    let mut listing = String::new();
-                    data.read_to_string(&mut listing)
-                        .map_err(|e| e.to_string())?;
-                    drop(data);
-                    ftp_read_response(ctrl).ok();
-                    let mut entries: Vec<FileEntry> = listing
-                        .lines()
-                        .filter_map(parse_list_entry)
-                        .filter(|e| !e.is_dir)
-                        .collect();
-                    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
-                    entries.into_iter().next().map(|e| e.name)
-                } else {
-                    drop(data);
-                    diag.push("/image/: LIST failed".to_string());
-                    None
-                }
-            };
-
-            if let Some(ref img_name) = newest {
-                let path = format!("/image/{}", img_name);
-                let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-                match ftp_try_retr(ctrl, &ip, &path) {
-                    Ok(Some(bytes)) => {
-                        if let Some(p) = cache_path.parent() {
-                            std::fs::create_dir_all(p).ok();
-                        }
-                        std::fs::write(&cache_path, &bytes).ok();
-                        return Ok(format!(
-                            "data:{};base64,{}",
-                            detect_mime(&bytes),
-                            STANDARD.encode(&bytes)
-                        ));
-                    }
-                    Ok(None) => diag.push(format!("{path}: 550")),
-                    Err(e) => diag.push(format!("{path}: err({e})")),
-                }
-            }
+    let mut gcode = vec![format!("/cache/{subtask_name}.gcode")];
+    if let Some(idx) = subtask_name.rfind("_plate_") {
+        gcode.push(format!(
+            "/cache/{subtask_name}{}.gcode",
+            &subtask_name[idx..]
+        ));
+    }
+    for path in &gcode {
+        match ftp::read(ftp, path, PREVIEW_HEADER_BYTES).await {
+            Ok(Some(header)) => match parse_gcode_thumbnail(&header) {
+                Some(bytes) => return Ok(bytes),
+                None => tried.push(format!("{path}: no thumbnail in header")),
+            },
+            Ok(None) => tried.push(format!("{path}: not found")),
+            Err(e) => tried.push(e),
         }
-
-        // ── 2. Try pre-rendered JPEG/PNG files in /cache/ ────────────────────
-        {
-            let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-            for path in &[
-                format!("/cache/{}.jpg", subtask_name),
-                format!("/cache/{}.jpeg", subtask_name),
-                format!("/cache/{}.png", subtask_name),
-            ] {
-                match ftp_try_retr(ctrl, &ip, path) {
-                    Ok(Some(bytes)) => {
-                        if let Some(p) = cache_path.parent() {
-                            std::fs::create_dir_all(p).ok();
-                        }
-                        std::fs::write(&cache_path, &bytes).ok();
-                        return Ok(format!(
-                            "data:{};base64,{}",
-                            detect_mime(&bytes),
-                            STANDARD.encode(&bytes)
-                        ));
-                    }
-                    Ok(None) => diag.push(format!("{path}: 550")),
-                    Err(e) => diag.push(format!("{path}: err({e})")),
-                }
-            }
-        }
-
-        // ── 3. Extract thumbnail from the gcode file header ───────────────────
-        {
-            let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-            let mut gcode_candidates = vec![format!("/cache/{}.gcode", subtask_name)];
-            if let Some(idx) = subtask_name.rfind("_plate_") {
-                let suffix = &subtask_name[idx..];
-                gcode_candidates.push(format!("/cache/{}{}.gcode", subtask_name, suffix));
-            }
-            for gcode_path in &gcode_candidates {
-                match ftp_read_partial(ctrl, &ip, gcode_path, 2 * 1024 * 1024) {
-                    Ok(header) => {
-                        let head_str =
-                            String::from_utf8_lossy(&header[..header.len().min(300)]).to_string();
-                        diag.push(format!(
-                            "{gcode_path}: {len}b, head={head_str:?}",
-                            len = header.len()
-                        ));
-                        if let Some(bytes) = parse_gcode_thumbnail(&header) {
-                            if let Some(p) = cache_path.parent() {
-                                std::fs::create_dir_all(p).ok();
-                            }
-                            std::fs::write(&cache_path, &bytes).ok();
-                            return Ok(format!(
-                                "data:{};base64,{}",
-                                detect_mime(&bytes),
-                                STANDARD.encode(&bytes)
-                            ));
-                        } else {
-                            diag.push("no thumbnail in header".to_string());
-                        }
-                    }
-                    Err(e) => diag.push(format!("{gcode_path}: err({e})")),
-                }
-            }
-        }
-
-        Err(diag.join(" | "))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
+    Err(tried.join(" | "))
 }
 
 #[tauri::command]
@@ -1869,142 +1439,23 @@ async fn download_file(
     app: AppHandle,
     state: TauriState<'_, AppState>,
 ) -> Result<String, String> {
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
     let filename = path.split('/').last().unwrap_or("download").to_owned();
     let save_dir = app
         .path()
         .download_dir()
         .or_else(|_| app.path().app_data_dir())
         .map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&save_dir).ok();
-    let save_path = save_dir.join(&filename);
+    let _ = tokio::fs::create_dir_all(&save_dir).await;
 
-    tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let mut slot = ftp_arc.lock().unwrap();
-        let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-
-        let data_addr = ftp_pasv(ctrl, &ip)?;
-        ftp_writeln(ctrl, &format!("RETR {}", path))?;
-
-        let data_tcp =
-            std::net::TcpStream::connect(data_addr).map_err(|e| format!("Data connect: {}", e))?;
-        data_tcp
-            .set_read_timeout(Some(std::time::Duration::from_secs(300)))
-            .ok();
-        let mut data = ftps_tls_stream(&ip, data_tcp)?;
-
-        let (code, msg) = ftp_read_response(ctrl)?;
-        if code != 125 && code != 150 {
-            return Err(format!("RETR: {} {}", code, msg));
-        }
-
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        drop(data);
-        ftp_read_response(ctrl).ok();
-
-        std::fs::write(&save_path, &bytes).map_err(|e| e.to_string())?;
-        Ok(filename)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn delete_file(path: String, state: TauriState<'_, AppState>) -> Result<(), String> {
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut slot = ftp_arc.lock().unwrap();
-        let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-        ftp_writeln(ctrl, &format!("DELE {}", path))?;
-        let (code, msg) = ftp_read_response(ctrl)?;
-        if code != 250 {
-            return Err(format!("Delete failed: {} {}", code, msg));
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-// Recursively deletes a file or directory over the existing FTPS control connection.
-fn ftp_delete_recursive(ctrl: &mut FtpsStream, ip: &str, path: &str) -> Result<(), String> {
-    ftp_writeln(ctrl, &format!("DELE {}", path))?;
-    let (code, _) = ftp_read_response(ctrl)?;
-    if code == 250 {
-        return Ok(());
-    }
-
-    // Not a plain file — treat as directory: list, recurse, then RMD
-    let data_addr = ftp_pasv(ctrl, ip)?;
-    ftp_writeln(ctrl, &format!("LIST {}", path))?;
-
-    let data_tcp =
-        std::net::TcpStream::connect(data_addr).map_err(|e| format!("Data connect: {}", e))?;
-    data_tcp
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .ok();
-    let mut data = ftps_tls_stream(ip, data_tcp)?;
-
-    let (code, msg) = ftp_read_response(ctrl)?;
-    if code != 125 && code != 150 {
-        return Err(format!("LIST error: {} {}", code, msg));
-    }
-
-    let mut listing = String::new();
-    data.read_to_string(&mut listing)
-        .map_err(|e| e.to_string())?;
-    drop(data);
-    ftp_read_response(ctrl).ok();
-
-    let base = path.trim_end_matches('/');
-    let children: Vec<String> = listing
-        .lines()
-        .filter_map(parse_list_entry)
-        .map(|e| format!("{}/{}", base, e.name))
-        .collect();
-
-    for child in children {
-        ftp_delete_recursive(ctrl, ip, &child)?;
-    }
-
-    ftp_writeln(ctrl, &format!("RMD {}", path))?;
-    let (code, msg) = ftp_read_response(ctrl)?;
-    if code != 250 {
-        return Err(format!("RMD failed: {} {}", code, msg));
-    }
-    Ok(())
+    let mut ftp = ftp_session(&state).await?;
+    ftp::download(&mut ftp, &path, &save_dir.join(&filename)).await?;
+    Ok(filename)
 }
 
 #[tauri::command]
 async fn delete_entry(path: String, state: TauriState<'_, AppState>) -> Result<(), String> {
-    let (ip, access_code) = {
-        let conn = state.connection.lock().await;
-        let c = conn.as_ref().ok_or("Not connected")?;
-        (c.ip.clone(), c.access_code.clone())
-    };
-    let ftp_arc = Arc::clone(&state.ftp);
-
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut slot = ftp_arc.lock().unwrap();
-        let ctrl = ensure_ftp(&mut slot, &ip, &access_code)?;
-        ftp_delete_recursive(ctrl, &ip, &path)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let mut ftp = ftp_session(&state).await?;
+    ftp::remove(&mut ftp, &path).await
 }
 
 // ── Filament load / unload ────────────────────────────────────────────────────
@@ -2306,7 +1757,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             connection: Mutex::new(None),
-            ftp: Arc::new(std::sync::Mutex::new(None)),
+            ftp: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             connect_printer,
@@ -2317,7 +1768,6 @@ pub fn run() {
             set_print_speed,
             send_gcode,
             list_files,
-            delete_file,
             delete_entry,
             fetch_thumbnail,
             fetch_print_preview,
