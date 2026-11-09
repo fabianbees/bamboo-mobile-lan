@@ -34,3 +34,4 @@ socket2 = { version = "0.6.5", features = ["all"] }
 tauri-plugin-deep-link = "2.6.3"
 tauri-plugin-single-instance = { version = "2.5.5", features = ["deep-link"] }
 suppaftp = { version = "12.2.1", features = ["tokio-rustls-ring", "deprecated"] }
+serde_with = "3.24.0"

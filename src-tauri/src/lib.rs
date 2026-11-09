@@ -5,7 +5,6 @@ use rumqttc::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State as TauriState};
@@ -17,7 +16,9 @@ use tokio::{
 };
 
 mod ftp;
+mod status;
 use ftp::FileEntry;
+use status::{Camera, PrinterStatus, EXTERNAL_SPOOL_SLOT};
 
 // ── TLS: accept any certificate (Bambu printers use self-signed) ─────────────
 
@@ -76,75 +77,6 @@ pub(crate) fn lan_tls_config() -> Arc<rustls::ClientConfig> {
     )
 }
 
-// ── Printer status types (mirrored in vite-env.d.ts) ─────────────────────────
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct PrinterStatus {
-    pub nozzle_temp: f64,
-    pub nozzle_target: f64,
-    pub bed_temp: f64,
-    pub bed_target: f64,
-    pub progress: u8,
-    pub remaining_mins: u32,
-    pub layer_num: u32,
-    pub total_layer_num: u32,
-    pub stage: String,
-    pub gcode_state: String,
-    pub ams: Vec<AmsUnit>,
-    pub vt_tray: Option<AmsTray>,
-    pub chamber_light: bool,
-    pub spd_lvl: u8,
-    pub subtask_name: String,
-    pub task_id: String,
-    pub hms: Vec<String>,
-    pub device_name: String,
-    /// Global slot ID of the tray currently loaded in the nozzle.
-    /// 255 = nothing loaded, 254 = external spool, 0-15 = AMS slots.
-    pub tray_now: u8,
-    pub camera: Camera,
-}
-
-#[derive(Debug, Clone, Serialize, Default, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Camera {
-    /// No status report yet.
-    #[default]
-    Unknown,
-    /// JPEG frames over TLS on port 6000.
-    Jpeg,
-    /// RTSPS stream, played by the Android app's live view.
-    Rtsp { url: String },
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct AmsUnit {
-    pub id: u8,
-    pub humidity: u8,
-    pub trays: Vec<AmsTray>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AmsTray {
-    pub id: u8,
-    pub tray_type: String,
-    pub color: String,
-    pub name: String,
-    /// Default print temperature for this filament (°C). Sent in filament-change commands.
-    pub tray_temp: u16,
-}
-
-impl Default for AmsTray {
-    fn default() -> Self {
-        AmsTray {
-            id: 0,
-            tray_type: String::new(),
-            color: String::new(),
-            name: String::new(),
-            tray_temp: 210, // OrcaSlicer default
-        }
-    }
-}
-
 // ── Android notification plugin handle (mobile only) ─────────────────────────
 //
 // On Android the foreground-service notification must be driven from Rust so
@@ -166,7 +98,7 @@ pub(crate) struct LiveViewHandle(pub tauri::plugin::PluginHandle<tauri::Wry>);
 
 /// Payload for startNotification / updateNotification commands.
 #[cfg(mobile)]
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct NotifArgs {
     title: String,
     body: String,
@@ -318,252 +250,6 @@ struct ConnectionHandles {
     mqtt_client: AsyncClient,
     abort_handles: Vec<AbortHandle>,
     status: Arc<Mutex<PrinterStatus>>,
-}
-
-// ── MQTT payload parsing ──────────────────────────────────────────────────────
-
-fn parse_status(payload: &[u8], status: &mut PrinterStatus) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return;
-    };
-
-    // device_name is set via SSDP discovery (DevName.bambu.com), not MQTT.
-
-    let Some(p) = v.get("print") else { return };
-
-    macro_rules! f64_field {
-        ($dst:expr, $key:expr) => {
-            if let Some(n) = p.get($key).and_then(|v| {
-                v.as_f64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            }) {
-                $dst = n;
-            }
-        };
-    }
-    macro_rules! u64_field {
-        ($dst:expr, $key:expr) => {
-            if let Some(n) = p.get($key).and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            }) {
-                $dst = n as _;
-            }
-        };
-    }
-    macro_rules! str_field {
-        ($dst:expr, $key:expr) => {
-            if let Some(v) = p.get($key) {
-                if let Some(s) = v.as_str() {
-                    $dst = s.to_owned();
-                } else if let Some(n) = v.as_u64() {
-                    $dst = n.to_string();
-                } else if let Some(n) = v.as_i64() {
-                    $dst = n.to_string();
-                }
-            }
-        };
-    }
-
-    f64_field!(status.nozzle_temp, "nozzle_temper");
-    f64_field!(status.nozzle_target, "nozzle_target_temper");
-    f64_field!(status.bed_temp, "bed_temper");
-    f64_field!(status.bed_target, "bed_target_temper");
-    u64_field!(status.progress, "mc_percent");
-    u64_field!(status.remaining_mins, "mc_remaining_time");
-    u64_field!(status.layer_num, "layer_num");
-    u64_field!(status.total_layer_num, "total_layer_num");
-    u64_field!(status.spd_lvl, "spd_lvl");
-    str_field!(status.gcode_state, "gcode_state");
-    str_field!(status.subtask_name, "subtask_name");
-    str_field!(status.task_id, "task_id");
-
-    if let Some(n) = p.get("stg_cur").and_then(|v| v.as_u64()) {
-        status.stage = stage_name(n);
-    }
-
-    if let Some(lights) = p.get("lights_report").and_then(|v| v.as_array()) {
-        for light in lights {
-            if light.get("node").and_then(|v| v.as_str()) == Some("chamber_light") {
-                status.chamber_light = light.get("mode").and_then(|v| v.as_str()) == Some("on");
-            }
-        }
-    }
-
-    // A1/P1 report no RTSPS URL; RTSPS printers report "disable" while LAN liveview is off.
-    let rtsp_url = p
-        .get("ipcam")
-        .and_then(|c| c.get("rtsp_url"))
-        .and_then(|v| v.as_str());
-    let full_report = p.get("command").and_then(|v| v.as_str()) == Some("push_status");
-    match rtsp_url {
-        Some(url) if url.starts_with("rtsp") => {
-            status.camera = Camera::Rtsp {
-                url: url.to_owned(),
-            }
-        }
-        Some(_) => status.camera = Camera::Jpeg,
-        None if full_report && status.camera == Camera::Unknown => status.camera = Camera::Jpeg,
-        None => {}
-    }
-
-    // Bambu firmware sends numeric IDs as JSON strings ("0", "1", …).
-    // parse_u8 accepts both forms and is reused for AMS and vt_tray parsing.
-    let parse_u8 = |v: &serde_json::Value| -> u8 {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            .unwrap_or(0) as u8
-    };
-
-    if let Some(ams_obj) = p.get("ams") {
-        // tray_now: global slot ID of currently-loaded tray. "255" = nothing loaded.
-        if let Some(tn) = ams_obj.get("tray_now") {
-            status.tray_now = parse_u8(tn);
-        }
-
-        if let Some(ams_arr) = ams_obj.get("ams").and_then(|v| v.as_array()) {
-            status.ams = ams_arr
-                .iter()
-                .filter_map(|unit| {
-                    let id = parse_u8(unit.get("id")?);
-                    let humidity = unit.get("humidity").map(parse_u8).unwrap_or(0);
-                    let trays = unit
-                        .get("tray")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|t| {
-                                    let id =
-                                        parse_u8(t.get("id").unwrap_or(&serde_json::Value::Null));
-                                    let tray_type = t
-                                        .get("tray_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_owned();
-                                    let raw = t
-                                        .get("tray_color")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("3F3F4600");
-                                    // colour is RRGGBBAA; we only need RRGGBB
-                                    let color = raw[..raw.len().min(6)].to_owned();
-                                    let name = t
-                                        .get("tray_sub_brands")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_owned();
-                                    // tray_temp is "220" etc. — may be absent for empty slots.
-                                    let tray_temp: u16 = t
-                                        .get("tray_temp")
-                                        .and_then(|v| {
-                                            v.as_u64()
-                                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                                        })
-                                        .unwrap_or(220) as u16;
-                                    AmsTray {
-                                        id,
-                                        tray_type,
-                                        color,
-                                        name,
-                                        tray_temp,
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Some(AmsUnit {
-                        id,
-                        humidity,
-                        trays,
-                    })
-                })
-                .collect();
-        }
-    }
-
-    // External spool (mounted outside AMS)
-    if let Some(vt) = p.get("vt_tray") {
-        let tray_type = vt
-            .get("tray_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        status.vt_tray = if !tray_type.is_empty() {
-            let id = parse_u8(vt.get("id").unwrap_or(&serde_json::Value::Null));
-            let raw = vt
-                .get("tray_color")
-                .and_then(|v| v.as_str())
-                .unwrap_or("3F3F4600");
-            let color = raw[..raw.len().min(6)].to_owned();
-            let name = vt
-                .get("tray_sub_brands")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let tray_temp: u16 = vt
-                .get("tray_temp")
-                .and_then(|v| {
-                    v.as_u64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                })
-                .unwrap_or(220) as u16;
-            Some(AmsTray {
-                id,
-                tray_type,
-                color,
-                name,
-                tray_temp,
-            })
-        } else {
-            None
-        };
-    }
-
-    // HMS error codes — each entry has `attr` and `code` (both u32 hex strings).
-    // Combine them into the 8-char key used in errors.json, e.g. "03008001".
-    // Only update hms when the key is present. Bambu sends incremental updates
-    // so most messages omit `hms` entirely — clearing on absence would cause
-    // errors to disappear after a single tick.
-    if let Some(hms_val) = p.get("hms") {
-        status.hms = hms_val
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|entry| {
-                        let attr = entry.get("attr").and_then(|v| v.as_u64())?;
-                        let code = entry.get("code").and_then(|v| v.as_u64())?;
-                        let s = format!("{:08X}{:08X}", attr, code);
-                        Some(format!(
-                            "{}-{}-{}-{}",
-                            &s[0..4],
-                            &s[4..8],
-                            &s[8..12],
-                            &s[12..16]
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-    }
-}
-
-fn stage_name(stg: u64) -> String {
-    match stg {
-        0 => "Idle",
-        1 => "Auto bed leveling",
-        2 => "Heatbed preheating",
-        4 => "Changing filament",
-        7 => "Heating hotend",
-        9 => "Scanning bed surface",
-        10 => "Inspecting first layer",
-        13 => "Homing toolhead",
-        14 => "Cleaning nozzle",
-        17 => "Printing",
-        20 => "Paused by user",
-        22 => "Filament unloading",
-        24 => "Filament loading",
-        _ => "Working",
-    }
-    .to_owned()
 }
 
 // ── SSDP: retrieve DevName.bambu.com via unicast M-SEARCH + multicast NOTIFY ──
@@ -1141,7 +827,9 @@ async fn connect_printer(
                     let st_snapshot = {
                         let mut st = status_c.lock().await;
                         let prev_name = st.device_name.clone();
-                        parse_status(&msg.payload, &mut st);
+                        if let Err(e) = st.apply(&msg.payload) {
+                            let _ = app_c.emit("mqtt-error", format!("unparseable report: {e}"));
+                        }
                         if st.device_name != prev_name && !st.device_name.is_empty() {
                             let _ = app_c.emit("printer-name", &st.device_name);
                         }
@@ -1168,7 +856,8 @@ async fn connect_printer(
                         );
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    let _ = app_c.emit("mqtt-error", e.to_string());
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 _ => {}
@@ -1566,22 +1255,13 @@ async fn delete_entry(path: String, state: TauriState<'_, AppState>) -> Result<(
 //   tar_temp  – nozzle temp of the filament being loaded
 // OrcaSlicer defaults both temps to 210 when unspecified.
 
-// Returns the print temperature for any global slot ID.
+const ORCA_DEFAULT_TEMP: u16 = 210;
+
+// Returns the print temperature for any global slot ID; 255 means nothing loaded.
 fn tray_temperature(status: &PrinterStatus, global_id: u8) -> u16 {
     match global_id {
-        254 => status.vt_tray.as_ref().map(|t| t.tray_temp).unwrap_or(210),
-        255 => 210, // nothing loaded — OrcaSlicer default
-        id => {
-            let unit_id = id / 4;
-            let slot_id = id % 4;
-            status
-                .ams
-                .iter()
-                .find(|u| u.id == unit_id)
-                .and_then(|u| u.trays.iter().find(|t| t.id == slot_id))
-                .map(|t| t.tray_temp)
-                .unwrap_or(210)
-        }
+        255 => ORCA_DEFAULT_TEMP,
+        id => status.tray_temperature(id).unwrap_or(ORCA_DEFAULT_TEMP),
     }
 }
 
@@ -1600,7 +1280,7 @@ async fn load_filament(tray_id: u8, state: TauriState<'_, AppState>) -> Result<(
 
         // Decompose global tray_id into the three fields OrcaSlicer sends.
         // VT tray (254): OrcaSlicer maps ams_id 254→255, leaving target=255, slot_id=0.
-        let (ams_id, target, slot_id): (u8, u8, u8) = if tray_id == 254 {
+        let (ams_id, target, slot_id): (u8, u8, u8) = if tray_id == EXTERNAL_SPOOL_SLOT {
             (255, 255, 0)
         } else {
             let unit = tray_id / 4;
@@ -1639,7 +1319,7 @@ async fn unload_filament(state: TauriState<'_, AppState>) -> Result<(), String> 
         let curr_tray = status.tray_now;
         let curr_temp = tray_temperature(&status, curr_tray);
         // ams_id for unload = the unit that is currently loaded, or 255 if none.
-        let ams_id: u8 = if curr_tray == 255 || curr_tray == 254 {
+        let ams_id: u8 = if curr_tray == 255 || curr_tray == EXTERNAL_SPOOL_SLOT {
             255
         } else {
             curr_tray / 4

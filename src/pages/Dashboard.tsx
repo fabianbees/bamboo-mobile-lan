@@ -13,10 +13,14 @@ import Section from '../components/Section';
 import PrintStatusCard from '../components/PrintStatusCard';
 import TempGauge from '../components/TempGauge';
 import AmsView from '../components/AmsView';
-import ExternalSpool, { VT_TRAY_ID } from '../components/ExternalSpool';
+import ExternalSpool from '../components/ExternalSpool';
 import SpeedGauge from '../components/SpeedGauge';
 import JogControls from '../components/JogControls';
 import ErrorPopup from '../components/ErrorPopup';
+
+function formatTemp(current: number, target: number) {
+  return `${Math.round(current)}${target > 0 ? ` → ${Math.round(target)}` : ''}°C`;
+}
 
 async function notify(title: string, body: string) {
   let granted = await isPermissionGranted();
@@ -152,7 +156,7 @@ export default function Dashboard({
   }
 
   const hasFilament =
-    status && (status.ams.length > 0 || status.vt_tray != null);
+    status && (status.ams.length > 0 || status.external_spools.length > 0);
 
   return (
     <div className='min-h-screen bg-zinc-950 text-white flex flex-col relative'>
@@ -283,87 +287,106 @@ export default function Dashboard({
                     <span className='text-gray-300'>Printer</span>
                   </div>
                 }>
-                <div className='grid grid-cols-3 w-full gap-3'>
-                  <TempGauge
-                    icon={
-                      <svg
-                        width='32'
-                        height='32'
-                        viewBox='0 0 32 32'
-                        fill='none'
-                        xmlns='http://www.w3.org/2000/svg'>
-                        <g clip-path='url(#clip0_4_2)'>
+                <div className='flex flex-col w-full gap-3'>
+                  <div className='grid grid-cols-3 w-full gap-3'>
+                    <TempGauge
+                      icon={
+                        <svg
+                          width='32'
+                          height='32'
+                          viewBox='0 0 32 32'
+                          fill='none'
+                          xmlns='http://www.w3.org/2000/svg'>
+                          <g clip-path='url(#clip0_4_2)'>
+                            <path
+                              d='M9 2V12M23 2V12M2.70711 12.2929L16.7071 26.2929M15.2931 26.2927L29.3017 12.2927M10 12H2M30 12H22M8 1H24'
+                              stroke='currentColor'
+                              stroke-width='2'
+                            />
+                            <path
+                              d='M10.9639 22.9639C10.9868 23.1408 11 23.3194 11 23.5C11 24.6176 10.5494 25.6649 9.78125 26.625C9.21603 27.3315 9 27.9509 9 28.5C9 29.0491 9.21603 29.6685 9.78125 30.375C10.1263 30.8063 10.0563 31.4362 9.625 31.7812C9.19374 32.1263 8.56376 32.0563 8.21875 31.625C7.45064 30.6649 7 29.6176 7 28.5C7 27.3824 7.45064 26.3351 8.21875 25.375C8.78397 24.6685 9 24.0491 9 23.5C9 22.9509 8.78397 22.3315 8.21875 21.625C7.57453 20.8197 7.15417 19.9531 7.03516 19.0352L10.9639 22.9639Z'
+                              fill='currentColor'
+                            />
+                            <path
+                              d='M15.8916 27.8916L16 28.0332L16.0166 28.0166L16.0332 28.0332L16.0625 27.9932C16.0211 28.1687 16 28.3372 16 28.5C16 29.0491 16.216 29.6685 16.7812 30.375C17.1263 30.8063 17.0563 31.4362 16.625 31.7812C16.1937 32.1263 15.5638 32.0563 15.2188 31.625C14.4506 30.6649 14 29.6176 14 28.5C14 27.8025 14.1745 27.1318 14.4932 26.4932L15.8916 27.8916Z'
+                              fill='currentColor'
+                            />
+                            <path
+                              d='M23.7812 20.375C24.5494 21.3351 25 22.3824 25 23.5C25 24.6176 24.5494 25.6649 23.7812 26.625C23.216 27.3315 23 27.9509 23 28.5C23 29.0491 23.216 29.6685 23.7812 30.375C24.1263 30.8063 24.0563 31.4362 23.625 31.7812C23.1937 32.1263 22.5638 32.0563 22.2188 31.625C21.4506 30.6649 21 29.6176 21 28.5C21 27.3824 21.4506 26.3351 22.2188 25.375C22.784 24.6685 23 24.0491 23 23.5C23 22.9786 22.8035 22.3951 22.2998 21.7324L23.7275 20.3037C23.7456 20.327 23.7625 20.3515 23.7812 20.375Z'
+                              fill='currentColor'
+                            />
+                          </g>
+                          <defs>
+                            <clipPath id='clip0_4_2'>
+                              <rect width='32' height='32' fill='white' />
+                            </clipPath>
+                          </defs>
+                        </svg>
+                      }
+                      actual={status.nozzle_temp}
+                      target={status.nozzle_target}
+                      max={300}
+                      onSet={(t) => sendGcode(`M104 S${t}`)}
+                    />
+                    <TempGauge
+                      icon={
+                        <svg
+                          width='32'
+                          height='32'
+                          viewBox='0 0 32 32'
+                          fill='none'
+                          xmlns='http://www.w3.org/2000/svg'>
                           <path
-                            d='M9 2V12M23 2V12M2.70711 12.2929L16.7071 26.2929M15.2931 26.2927L29.3017 12.2927M10 12H2M30 12H22M8 1H24'
+                            d='M16 1.00003C17.3333 2.6667 17.3333 4.33336 16 6.00003C14.6667 7.6667 14.6667 9.33336 16 11C17.3333 12.6667 17.3333 14.3334 16 16C14.6667 17.6667 14.6667 19.3334 16 21M23 1.00003C24.3333 2.6667 24.3333 4.33336 23 6.00003C21.6667 7.6667 21.6667 9.33336 23 11C24.3333 12.6667 24.3333 14.3334 23 16C21.6667 17.6667 21.6667 19.3334 23 21M9 1.00003C10.3333 2.6667 10.3333 4.33336 9 6.00003C7.66667 7.6667 7.66667 9.33336 9 11C10.3333 12.6667 10.3333 14.3334 9 16C7.66667 17.6667 7.66667 19.3334 9 21M3 31H29C30.1046 31 31 30.1046 31 29V27C31 25.8955 30.1046 25 29 25H3C1.89543 25 1 25.8955 1 27V29C1 30.1046 1.89543 31 3 31Z'
                             stroke='currentColor'
                             stroke-width='2'
+                            stroke-linecap='round'
+                            stroke-linejoin='round'
                           />
-                          <path
-                            d='M10.9639 22.9639C10.9868 23.1408 11 23.3194 11 23.5C11 24.6176 10.5494 25.6649 9.78125 26.625C9.21603 27.3315 9 27.9509 9 28.5C9 29.0491 9.21603 29.6685 9.78125 30.375C10.1263 30.8063 10.0563 31.4362 9.625 31.7812C9.19374 32.1263 8.56376 32.0563 8.21875 31.625C7.45064 30.6649 7 29.6176 7 28.5C7 27.3824 7.45064 26.3351 8.21875 25.375C8.78397 24.6685 9 24.0491 9 23.5C9 22.9509 8.78397 22.3315 8.21875 21.625C7.57453 20.8197 7.15417 19.9531 7.03516 19.0352L10.9639 22.9639Z'
-                            fill='currentColor'
-                          />
-                          <path
-                            d='M15.8916 27.8916L16 28.0332L16.0166 28.0166L16.0332 28.0332L16.0625 27.9932C16.0211 28.1687 16 28.3372 16 28.5C16 29.0491 16.216 29.6685 16.7812 30.375C17.1263 30.8063 17.0563 31.4362 16.625 31.7812C16.1937 32.1263 15.5638 32.0563 15.2188 31.625C14.4506 30.6649 14 29.6176 14 28.5C14 27.8025 14.1745 27.1318 14.4932 26.4932L15.8916 27.8916Z'
-                            fill='currentColor'
-                          />
-                          <path
-                            d='M23.7812 20.375C24.5494 21.3351 25 22.3824 25 23.5C25 24.6176 24.5494 25.6649 23.7812 26.625C23.216 27.3315 23 27.9509 23 28.5C23 29.0491 23.216 29.6685 23.7812 30.375C24.1263 30.8063 24.0563 31.4362 23.625 31.7812C23.1937 32.1263 22.5638 32.0563 22.2188 31.625C21.4506 30.6649 21 29.6176 21 28.5C21 27.3824 21.4506 26.3351 22.2188 25.375C22.784 24.6685 23 24.0491 23 23.5C23 22.9786 22.8035 22.3951 22.2998 21.7324L23.7275 20.3037C23.7456 20.327 23.7625 20.3515 23.7812 20.375Z'
-                            fill='currentColor'
-                          />
-                        </g>
-                        <defs>
-                          <clipPath id='clip0_4_2'>
-                            <rect width='32' height='32' fill='white' />
-                          </clipPath>
-                        </defs>
-                      </svg>
-                    }
-                    actual={status.nozzle_temp}
-                    target={status.nozzle_target}
-                    max={300}
-                    onSet={(t) => sendGcode(`M104 S${t}`)}
-                  />
-                  <TempGauge
-                    icon={
-                      <svg
-                        width='32'
-                        height='32'
-                        viewBox='0 0 32 32'
-                        fill='none'
-                        xmlns='http://www.w3.org/2000/svg'>
-                        <path
-                          d='M16 1.00003C17.3333 2.6667 17.3333 4.33336 16 6.00003C14.6667 7.6667 14.6667 9.33336 16 11C17.3333 12.6667 17.3333 14.3334 16 16C14.6667 17.6667 14.6667 19.3334 16 21M23 1.00003C24.3333 2.6667 24.3333 4.33336 23 6.00003C21.6667 7.6667 21.6667 9.33336 23 11C24.3333 12.6667 24.3333 14.3334 23 16C21.6667 17.6667 21.6667 19.3334 23 21M9 1.00003C10.3333 2.6667 10.3333 4.33336 9 6.00003C7.66667 7.6667 7.66667 9.33336 9 11C10.3333 12.6667 10.3333 14.3334 9 16C7.66667 17.6667 7.66667 19.3334 9 21M3 31H29C30.1046 31 31 30.1046 31 29V27C31 25.8955 30.1046 25 29 25H3C1.89543 25 1 25.8955 1 27V29C1 30.1046 1.89543 31 3 31Z'
+                        </svg>
+                      }
+                      actual={status.bed_temp}
+                      target={status.bed_target}
+                      max={120}
+                      onSet={(t) => sendGcode(`M140 S${t}`)}
+                    />
+                    <SpeedGauge
+                      level={speedLevel}
+                      onSet={setSpeed}
+                      icon={
+                        <svg
+                          xmlns='http://www.w3.org/2000/svg'
+                          width='32'
+                          height='32'
+                          viewBox='0 0 24 24'
+                          fill='none'
                           stroke='currentColor'
-                          stroke-width='2'
-                          stroke-linecap='round'
-                          stroke-linejoin='round'
-                        />
-                      </svg>
-                    }
-                    actual={status.bed_temp}
-                    target={status.bed_target}
-                    max={120}
-                    onSet={(t) => sendGcode(`M140 S${t}`)}
-                  />
-                  <SpeedGauge
-                    level={speedLevel}
-                    onSet={setSpeed}
-                    icon={
-                      <svg
-                        xmlns='http://www.w3.org/2000/svg'
-                        width='32'
-                        height='32'
-                        viewBox='0 0 24 24'
-                        fill='none'
-                        stroke='currentColor'
-                        strokeWidth='2'
-                        strokeLinecap='round'
-                        strokeLinejoin='round'>
-                        <path d='m12 14 4-4' />
-                        <path d='M3.34 19a10 10 0 1 1 17.32 0' />
-                      </svg>
-                    }
-                  />
+                          strokeWidth='2'
+                          strokeLinecap='round'
+                          strokeLinejoin='round'>
+                          <path d='m12 14 4-4' />
+                          <path d='M3.34 19a10 10 0 1 1 17.32 0' />
+                        </svg>
+                      }
+                    />
+                  </div>
+                  {(status.nozzles.length > 0 || status.chamber) && (
+                    <div className='flex flex-wrap justify-center gap-x-3 gap-y-1 text-xs text-zinc-400 tabular-nums'>
+                      {status.nozzles.map((n) => (
+                        <span key={n.side}>
+                          {n.side === 'left' ? 'Left' : 'Right'}{' '}
+                          {formatTemp(n.current, n.target)}
+                          {n.active && <span className='text-teal-400'> ●</span>}
+                        </span>
+                      ))}
+                      {status.chamber && (
+                        <span>
+                          Chamber{' '}
+                          {formatTemp(status.chamber.current, status.chamber.target)}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
               </Section>
             )}
@@ -401,7 +424,7 @@ export default function Dashboard({
               </Section>
             )}
 
-            {status?.vt_tray && (
+            {status && status.external_spools.length > 0 && (
               <Section
                 icon={
                   <div className='flex flex-col items-center justify-center gap-2'>
@@ -425,12 +448,20 @@ export default function Dashboard({
                     <span className='text-gray-300'>Ext. Fila.</span>
                   </div>
                 }>
-                <ExternalSpool
-                  tray={status!.vt_tray}
-                  selected={selectedTrayId === VT_TRAY_ID}
-                  active={status!.tray_now === VT_TRAY_ID}
-                  onSelect={() => setSelectedTrayId((prev) => prev === VT_TRAY_ID ? null : VT_TRAY_ID)}
-                />
+                <div className='flex flex-col w-full gap-3'>
+                  {status.external_spools.map((spool) => (
+                    <ExternalSpool
+                      key={spool.slot}
+                      spool={spool}
+                      selected={spool.loadable && selectedTrayId === spool.slot}
+                      onSelect={
+                        spool.loadable ?
+                          () => setSelectedTrayId((prev) => (prev === spool.slot ? null : spool.slot))
+                        : undefined
+                      }
+                    />
+                  ))}
+                </div>
               </Section>
             )}
           </div>

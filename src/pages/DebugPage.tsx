@@ -6,8 +6,14 @@ interface RawMessage {
   id: number;
   ts: string;
   parsed: unknown;
-  kind: 'mqtt' | 'ssdp';
+  kind: 'mqtt' | 'ssdp' | 'error';
 }
+
+const KIND_STYLE = {
+  mqtt: { box: 'bg-zinc-900 border-zinc-800', head: 'bg-zinc-800 border-zinc-700', id: 'text-zinc-500', tag: 'text-zinc-600', body: 'text-green-400' },
+  ssdp: { box: 'bg-blue-950 border-blue-800', head: 'bg-blue-900 border-blue-800', id: 'text-blue-400 font-bold', tag: 'text-blue-400', body: 'text-blue-300' },
+  error: { box: 'bg-red-950 border-red-800', head: 'bg-red-900 border-red-800', id: 'text-red-400 font-bold', tag: 'text-red-400', body: 'text-red-300' },
+} as const;
 
 let seq = 0;
 
@@ -30,7 +36,11 @@ export default function DebugPage({ onMenuOpen }: { onMenuOpen: () => void }) {
       if (pausedRef.current) return;
       setMessages((prev) => [...prev.slice(-99), { id: ++seq, ts: new Date().toLocaleTimeString(), parsed: e.payload, kind: 'ssdp' as const }]);
     });
-    return () => { unsub.then((f) => f()); unsubSsdp.then((f) => f()); };
+    const unsubError = listen<string>('mqtt-error', (e) => {
+      if (pausedRef.current) return;
+      setMessages((prev) => [...prev.slice(-99), { id: ++seq, ts: new Date().toLocaleTimeString(), parsed: e.payload, kind: 'error' as const }]);
+    });
+    return () => { unsub.then((f) => f()); unsubSsdp.then((f) => f()); unsubError.then((f) => f()); };
   }, []);
 
   useEffect(() => {
@@ -79,13 +89,15 @@ export default function DebugPage({ onMenuOpen }: { onMenuOpen: () => void }) {
           <p className='text-zinc-600 text-center py-12'>Waiting for MQTT messages…</p>
         )}
         {messages.map((msg) => (
-          <div key={msg.id} className={`border rounded-lg overflow-hidden ${msg.kind === 'ssdp' ? 'bg-blue-950 border-blue-800' : 'bg-zinc-900 border-zinc-800'}`}>
-            <div className={`flex items-center gap-2 px-3 py-1.5 border-b ${msg.kind === 'ssdp' ? 'bg-blue-900 border-blue-800' : 'bg-zinc-800 border-zinc-700'}`}>
-              <span className={msg.kind === 'ssdp' ? 'text-blue-400 font-bold' : 'text-zinc-500'}>#{msg.id}</span>
+          <div key={msg.id} className={`border rounded-lg overflow-hidden ${KIND_STYLE[msg.kind].box}`}>
+            <div className={`flex items-center gap-2 px-3 py-1.5 border-b ${KIND_STYLE[msg.kind].head}`}>
+              <span className={KIND_STYLE[msg.kind].id}>#{msg.id}</span>
               <span className='text-zinc-400'>{msg.ts}</span>
-              <span className={`ml-auto text-xs ${msg.kind === 'ssdp' ? 'text-blue-400' : 'text-zinc-600'}`}>{msg.kind === 'ssdp' ? 'SSDP' : topLevelKey(msg.parsed)}</span>
+              <span className={`ml-auto text-xs ${KIND_STYLE[msg.kind].tag}`}>
+                {msg.kind === 'ssdp' ? 'SSDP' : msg.kind === 'error' ? 'ERROR' : topLevelKey(msg.parsed)}
+              </span>
             </div>
-            <pre className={`p-3 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed ${msg.kind === 'ssdp' ? 'text-blue-300' : 'text-green-400'}`}>
+            <pre className={`p-3 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed ${KIND_STYLE[msg.kind].body}`}>
               {typeof msg.parsed === 'string' ? msg.parsed : JSON.stringify(msg.parsed, null, 2)}
             </pre>
           </div>

@@ -30,11 +30,40 @@ export type Camera =
   | { kind: 'jpeg' }
   | { kind: 'rtsp'; url: string };
 
+export interface Temperature {
+  current: number;
+  target: number;
+}
+
+export interface Nozzle {
+  side: 'left' | 'right';
+  current: number;
+  target: number;
+  active: boolean;
+}
+
+export interface ExternalSpool {
+  /** Global slot ID, as in tray_now and load_filament. */
+  slot: number;
+  /** Set on dual-nozzle printers, which have a holder per side. */
+  side: 'left' | 'right' | null;
+  /** Whether load_filament supports this spool. */
+  loadable: boolean;
+  /** Feeding a nozzle. */
+  loaded: boolean;
+  tray: AmsTray;
+}
+
 export interface PrinterStatus {
+  /** The active nozzle. */
   nozzle_temp: number;
   nozzle_target: number;
+  /** Both nozzles of a dual-nozzle printer; empty on single-nozzle printers. */
+  nozzles: Nozzle[];
   bed_temp: number;
   bed_target: number;
+  /** Only for printers with a chamber sensor. */
+  chamber: Temperature | null;
   progress: number;
   remaining_mins: number;
   layer_num: number;
@@ -42,7 +71,7 @@ export interface PrinterStatus {
   stage: string;
   gcode_state: string;
   ams: AmsUnit[];
-  vt_tray: AmsTray | null;
+  external_spools: ExternalSpool[];
   chamber_light: boolean;
   spd_lvl: number;
   subtask_name: string;

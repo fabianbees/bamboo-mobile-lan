@@ -43,12 +43,12 @@ Projects like [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI) document 
 - 📊 **Print status & Controls** — view progress %, layer counter, remaining time, and start (pre-uploaded gcode), pause, resume, or stop prints.
 - 🗂️ **File Manager & Timelapses** — FTP (port 990) integration to view, download, delete files, and view model previews.
 - 🔔 **App Notifications** — push alerts for print completion and failures.
-- 🌡️ **Temperatures** — nozzle and bed with targets, now managed via dedicated UI modals.
+- 🌡️ **Temperatures** — nozzle and bed with targets, now managed via dedicated UI modals; both nozzles and the chamber on printers that report them (e.g. X2D, H2D).
 - 💡 **Chamber light** toggle (works regardless of whether the printer is running).
 - 🎛️ **Print speed** — dedicated dialog for Silent / Standard / Sport / Ludicrous modes.
 - 📱 **Refined UI/UX** — pull-to-refresh functionality, improved navigation, intuitive familiar layout, and respects Android safe area insets for edge-to-edge display.
 - 🧵 **AMS filament info** — per-unit humidity grade (A–E scale), per-slot type and colour.
-- 🪡 **External spool** display.
+- 🪡 **External spool** display, one per holder on dual-nozzle printers.
 - 🕹️ **Manual jog controls** — OrcaSlicer-style XY wheel, extruder column, Z/bed row with ±1/±10 mm steps and a home button.
 - 🛠️ **MQTT Debug Page** — built-in view for troubleshooting raw telemetry and error handling.
 - 💾 **Persistent credentials** — stored in app data via `tauri-plugin-store`, not in browser storage.
